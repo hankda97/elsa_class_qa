@@ -1,0 +1,29 @@
+[project]
+name = "elsa-class"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "lymiao99", email = "lymiao99@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "python-dotenv>=1.0.0",
+    "openai>=3.35.1",
+    "pandas>=3.0.6",
+    "scikit-learn>=1.9.1",
+    "seaborn>=0.13.2",
+    "sentence-transformers>=6.1.0",
+    "supabase>=2.0.0",
+    "streamlit>=1.40.0",
+]
+
+[project.scripts]
+elsa-class = "elsa_class:main"
+
+[build-system]
+requires = ["uv_build>=0.13.3,<0.14.0"]
+build-backend = "uv_build"

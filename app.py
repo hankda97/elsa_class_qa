@@ -1,6 +1,5 @@
-"""Streamlit FAQ assistant backed by semantic search over QA.csv."""
+"""Streamlit FAQ assistant using Supabase vector search."""
 
-import csv
 import os
 from pathlib import Path
 
@@ -8,60 +7,79 @@ import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from supabase import Client, create_client
 
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-CSV_PATH = Path(os.environ.get("QA_CSV_PATH", BASE_DIR / "QA.csv"))
 MODEL_NAME = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 MIN_SIMILARITY = float(os.environ.get("MIN_SIMILARITY", "0.30"))
 
 
+def get_setting(name: str) -> str | None:
+    """Read local .env values or Streamlit Community Cloud secrets."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return str(value) if value else None
+
+
 @st.cache_resource(show_spinner="正在載入語意模型（首次啟動可能需要一些時間）…")
-def get_model() -> SentenceTransformer:
-    return SentenceTransformer(MODEL_NAME, device="cpu")
+def get_model(model_name: str) -> SentenceTransformer:
+    return SentenceTransformer(model_name, device="cpu")
 
 
-@st.cache_resource(show_spinner="正在讀取客服知識庫並建立搜尋索引…")
-def get_knowledge_base(csv_path: str, model_name: str):
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"找不到知識庫檔案：{path}")
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        faqs = list(csv.DictReader(file))
-
-    required = {"question", "category", "product", "symptoms", "answer", "urgency"}
-    if not faqs or not required.issubset(faqs[0]):
-        raise ValueError("QA.csv 必須包含 question、category、product、symptoms、answer、urgency 欄位。")
-
-    texts = [
-        f"問題：{row['question']} 分類：{row['category']} 產品：{row['product']} 症狀：{row['symptoms']}"
-        for row in faqs
-    ]
-    model = get_model()
-    vectors = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-    return faqs, vectors
+@st.cache_resource(show_spinner=False)
+def get_supabase_client(url: str, anon_key: str) -> Client:
+    return create_client(url, anon_key)
 
 
-def answer_question(question: str, faqs: list[dict[str, str]], vectors: np.ndarray) -> dict:
-    model = get_model()
+def search_faq(question: str, model: SentenceTransformer, client: Client) -> tuple[dict | None, float]:
     query_vector = model.encode(question, normalize_embeddings=True, convert_to_numpy=True)
-    scores = vectors @ query_vector
-    best_index = int(np.argmax(scores))
-    return faqs[best_index], float(scores[best_index])
+    if query_vector.shape[0] != 384:
+        raise ValueError(
+            f"目前模型輸出 {query_vector.shape[0]} 維向量；qa_semantic 表需要 384 維。"
+        )
+
+    result = client.rpc(
+        "match_qa_semantic",
+        {
+            "query_embedding": query_vector.astype(np.float32).tolist(),
+            "match_count": 5,
+            "filter_category": None,
+        },
+    ).execute()
+    rows = result.data or []
+    if not rows:
+        return None, 0.0
+    best = rows[0]
+    return best, float(best.get("similarity", 0.0))
 
 
 st.set_page_config(page_title="電腦產品問題小幫手", page_icon="💻")
 st.title("💻 電腦產品問題小幫手")
-st.caption("描述你遇到的電腦或周邊設備問題，我會從客服知識庫搜尋相近案例並提供處理建議。")
+st.caption("描述你遇到的電腦或周邊設備問題，我會從 Supabase 客服知識庫搜尋相近案例並提供處理建議。")
+
+supabase_url = get_setting("SUPABASE_URL")
+supabase_key = get_setting("SUPABASE_ANON_KEY")
+if not supabase_url or not supabase_key:
+    st.error(
+        "找不到 Supabase 連線設定。請在本機 .env 設定 SUPABASE_URL 和 SUPABASE_ANON_KEY；"
+        "部署到 Streamlit Community Cloud 時，請在 App Settings → Secrets 設定相同名稱。"
+    )
+    st.stop()
 
 try:
-    MODEL = get_model()
-    FAQS, FAQ_VECTORS = get_knowledge_base(str(CSV_PATH), MODEL_NAME)
+    MODEL = get_model(MODEL_NAME)
+    SUPABASE = get_supabase_client(supabase_url, supabase_key)
 except Exception as exc:
-    st.error(f"知識庫或語意模型載入失敗：{exc}")
+    st.error(f"模型或 Supabase 初始化失敗：{exc}")
     st.stop()
 
 if "messages" not in st.session_state:
@@ -96,9 +114,19 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("正在搜尋相近問題…"):
-            faq, similarity = answer_question(question, FAQS, FAQ_VECTORS)
-        if similarity < MIN_SIMILARITY:
+        with st.spinner("正在搜尋 Supabase 知識庫…"):
+            try:
+                faq, similarity = search_faq(question, MODEL, SUPABASE)
+            except Exception as exc:
+                # Keep server-side details out of the public chat interface.
+                print(f"Supabase FAQ search failed: {type(exc).__name__}: {exc}")
+                st.error(
+                    "Supabase 搜尋失敗。請確認 qa_semantic 資料表已有資料、"
+                    "match_qa_semantic RPC 函式已建立，且 anon 權限可讀取 FAQ。"
+                )
+                st.stop()
+
+        if faq is None or similarity < MIN_SIMILARITY:
             response = (
                 "目前知識庫找不到足夠相近的問題。請補充產品型號、作業系統、錯誤訊息，"
                 "以及問題發生前做過的操作；若有焦味、冒煙或異常高溫，請先停止使用並拔除電源。"
